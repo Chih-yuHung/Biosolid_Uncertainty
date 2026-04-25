@@ -1,0 +1,26 @@
+---
+title: "Biosolid uncertainty_N2O"
+format: html
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+The goal is to get data looks like this so I can apply my function directly. ![](images/Screenshot%202026-04-23%20164914.png)
+
+```{r}
+1 + 1
+```
+
+You can add options to executable code like this
+
+```{r}
+#| echo: false
+2 * 2
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
