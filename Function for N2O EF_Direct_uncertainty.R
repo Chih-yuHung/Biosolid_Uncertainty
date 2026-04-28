@@ -10,7 +10,7 @@ library(tidyverse)
 N2OEF_direct <- function(SiteData) {
   
   SiteData <- as.data.frame(SiteData)
-  #SiteData <- as.data.frame(df)
+  #SiteData <- as.data.frame(Data)
   
   #Create dataframe for results
   Result <- data.frame(
@@ -30,6 +30,7 @@ N2OEF_direct <- function(SiteData) {
     print("There are negative values in the data.")
     stop()
   } 
+  
   
   
   #assign the variables, I will provide an example for SiteData. This is in case I need to deal with different input
@@ -111,22 +112,21 @@ N2OEF_direct <- function(SiteData) {
   
   #Convert NSE, NS, and cropping system to their ratio factors
   Result$NSE <- ifelse(NSE == 1| NSE =="Y", coef_NSEF, 1)
-  Result$Crop_f <- ifelse(Crop_f == 1 | Crop_f == "annual", 1, 0.19)
-  #Result$NS[Result$Crop == 1 & NS == 1] <- 1, always 1 in this case. to save running time 
-  Result$NS <- ifelse(NS == 1, NS, 0.84) 
+  Result$Crop_f <- Crop_f
+  Result$NS <- ifelse(NS == 1, NS, coef_NS) 
   #Calculate the EF 
   Result <- Result %>%
-    mutate(EF = pmin(EF_base * NSE * Crop_f),1) %>%
+    mutate(EF = pmin(EF_base * NSE * Crop_f * NS, 1)) %>%
     mutate(N2O = EF * Fertilizer_Applied) %>%
-    select(-NSE, -Crop_f)
+    select(-NSE)
   
   
   #Calculate the EF and total emissions based on CropID and ProvinceID regardless of year
   Result_Prov_Crop <- Result %>%
-      group_by(Province,Crop) %>%
+      group_by(Province,Crop_f) %>%
       summarise(#Avg.N2O = mean(N2O),
                 #Tot.N2O = sum(N2O),
-                #Tot.Fert = sum(Fertilizer_Applied),
+                Tot.Fert = sum(Fertilizer_Applied),
                 N2O.IEF = ifelse(sum(Fertilizer_Applied) >0, sum(N2O)/sum(Fertilizer_Applied),0))
  
   # return(Result_Prov_Crop)

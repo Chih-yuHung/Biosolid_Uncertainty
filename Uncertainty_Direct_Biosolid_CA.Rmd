@@ -1,0 +1,252 @@
+---
+title: "Uncertainty_Direct-Biosolid"
+author: "Dr. Chih-Yu Hung"
+date: "2026-4-23"
+output: html_document
+---
+
+
+
+```{r data and function}
+# --- Packages ----
+library(tidyverse)
+library(future.apply)
+
+source("Function for N2O EF_Direct_uncertainty.R")
+
+#Environment parameters
+Text <- read_csv("Inputs/INPUT-EF_dep_para_texture.csv") %>% #Soil texture
+        select(ECODISTRIC, PROVINCE, Inv_Year_ID, Frac_Coarse, Frac_Medium, Frac_Fine)
+PPE<- read_csv("Inputs/INPUT-EF_Fixed_Para.csv") # To obtain Ecodistrict level P, PE, topo
+
+DF <- readRDS("Inputs/BiosolidN_corrected.rds") #Data from Change's work
+
+Data_Env <- DF %>%
+  left_join(Text, by = c("Ecodistrict_ID" = "ECODISTRIC", "Province_ID" = "PROVINCE", "Inv_Year_ID")) %>%
+  left_join(PPE, by = c("Ecodistrict_ID", "Province_ID")) %>%
+  mutate(NSE = 1, 
+         Nsource = 2) %>%
+  rename(Crop_f = Crop_System_ID ) %>% # 1 = annual, 2 = perennial, 3 IMPAST
+  mutate(Crop_f = case_when(
+         Crop_f == 1 ~ 1, 
+         Crop_f %in% c(2,3) ~ 0.19,
+         TRUE ~ NA_real_))
+
+Data <- Data_Env %>% filter(BION_corrected >0 ) %>% #ignore 0 fertilizer to speed up.
+        rename_at(c(5), ~c("Fert_LCA_kg")) %>%
+        na.omit() %>%
+        filter(Inv_Year_ID == 2015) # From the manuscript, can change target year for uncertainty analysis
+
+```
+
+```{r cars}
+# --- User knobs (you can change these) ----
+use_vec <- requireNamespace("vctrs", quietly = TRUE)
+n_mc  <- 2000
+seed  <- 2026
+workers    <- 6         # keep small on Windows (2–4)
+batch_size <- 50        # iterations per worker per future
+set.seed(seed)
+
+# 95% CI helper: p is the fractional half-width of the 95% interval relative to mu
+rnorm_ci <- function(mu, p95) {
+  sd <- abs(p95) * abs(mu) / 1.96
+  rnorm(length(mu), mean = mu, sd = sd)
+}
+
+# --- Core per-iteration worker (does NOT change your logic) ----
+run_one_mc <- function(i, Data,
+                       ci_list = list(
+                         Fert_LCA_kg = sqrt(0.15^2 + 0.46^2), #15% from application, 46% from N concentration
+                         P           = 0.10,
+                         PE          = 0.10,
+                         Topo        = 0.15,
+                         Frac_Fine   = 0.10,
+                         Frac_Medium = 0.10,
+                         Frac_Coarse = 0.10,
+                         Crop_f      = 0.305 #Rochete table 10, (25+36)/2 = 30.5
+                       ),
+                       par_means = list(
+                         slope      = 0.00558,
+                         intercept  = 7.701,
+                         coef_F     = 2.55,
+                         coef_M     = 0.49,
+                         coef_C     = 0.49,
+                         coef_NSEF  = 1/0.645,   # ≈ 1.5503876
+                         coef_NS    = 0.84
+                       ),
+                       par_ci = list(
+                         slope      = 0.22,
+                         intercept  = 0.11,
+                         coef_F     = 0.20,
+                         coef_M     = 0.20,
+                         coef_C     = 0.20,
+                         coef_NSEF  = 0.13,
+                         coef_NS    = 0.60 # From Chang's MS, I would say it's 95% CI not SD
+                       )
+) {
+  df <- Data
+  print(paste0("iteration = ",i))
+  eps <- 1e-9
+  
+  # --- 1) Stochastic perturbation of data columns (row-wise) ----
+  if ("Fert_LCA_kg" %in% names(df)) {
+    df$Fert_LCA_kg <- pmax(rnorm_ci(df$Fert_LCA_kg, ci_list$Fert_LCA_kg),0)
+  }
+  
+  if ("P" %in% names(df))  df$P  <- pmax(rnorm_ci(df$P,  ci_list$P),  0)
+  if ("PE" %in% names(df)) df$PE <- pmax(rnorm_ci(df$PE, ci_list$PE), 0)
+  #df$Precip <- df$P
+  #df$Evapo  <- df$PE
+
+  if ("Topo" %in% names(df)) {
+    df$Topo <- pmin(pmax(rnorm_ci(df$Topo, ci_list$Topo),0),1)
+  }
+
+
+  if (all(c("Frac_Fine","Frac_Medium","Frac_Coarse") %in% names(df))) {
+    Fhat <- pmax(rnorm_ci(df$Frac_Fine,   ci_list$Frac_Fine),   eps)
+    Mhat <- pmax(rnorm_ci(df$Frac_Medium, ci_list$Frac_Medium), eps)
+    Chat <- pmax(rnorm_ci(df$Frac_Coarse, ci_list$Frac_Coarse), eps)
+    s <- Fhat + Mhat + Chat
+    df$Frac_Fine   <- Fhat / s
+    df$Frac_Medium <- Mhat / s
+    df$Frac_Coarse <- Chat / s
+  }
+  
+    if ("Crop_f" %in% names(df)) {
+    df$Crop_f <- pmax(rnorm_ci(df$Crop_f, ci_list$Crop_f),0)
+  }
+  
+
+# --- 2) Sample parameters once per iteration ----
+  slope     <- rnorm(1, par_means$slope,     abs(par_ci$slope)     * abs(par_means$slope)     / 1.96)
+  intercept <- rnorm(1, par_means$intercept, abs(par_ci$intercept) * abs(par_means$intercept) / 1.96)
+  coef_F    <- rnorm(1, par_means$coef_F,    abs(par_ci$coef_F)    * abs(par_means$coef_F)    / 1.96)
+  coef_M    <- rnorm(1, par_means$coef_M,    abs(par_ci$coef_M)    * abs(par_means$coef_M)    / 1.96)
+  coef_C    <- rnorm(1, par_means$coef_C,    abs(par_ci$coef_C)    * abs(par_means$coef_C)    / 1.96)
+  coef_NSEF <- rnorm(1, par_means$coef_NSEF, abs(par_ci$coef_NSEF) * abs(par_means$coef_NSEF) / 1.96)
+  coef_NS   <- pmax(rnorm_ci(par_means$coef_NS,   par_ci$coef_NS), 0)
+
+
+
+# Bind into the environment where N2OEF_direct evaluates
+env_fn <- environment(N2OEF_direct)
+if (is.null(env_fn)) env_fn <- globalenv()  # just in case
+
+assign("slope",     slope,     envir = env_fn)
+assign("intercept", intercept, envir = env_fn)
+assign("coef_F",    coef_F,    envir = env_fn)
+assign("coef_M",    coef_M,    envir = env_fn)
+assign("coef_C",    coef_C,    envir = env_fn)
+assign("coef_NSEF", coef_NSEF, envir = env_fn)
+assign("coef_NS",   coef_NS,   envir = env_fn)
+
+# (optional) also bind to the caller's global env — harmless and can help if helpers look there
+assign("slope",     slope,     envir = .GlobalEnv)
+assign("intercept", intercept, envir = .GlobalEnv)
+assign("coef_F",    coef_F,    envir = .GlobalEnv)
+assign("coef_M",    coef_M,    envir = .GlobalEnv)
+assign("coef_C",    coef_C,    envir = .GlobalEnv)
+assign("coef_NSEF", coef_NSEF, envir = .GlobalEnv)
+assign("coef_NS",   coef_NS,   envir = .GlobalEnv)
+
+  # --- 3) Run your existing pipeline UNCHANGED to produce Result_Prov_Crop ----
+  Result_Prov_Crop <- N2OEF_direct(df)
+
+  stopifnot(exists("Result_Prov_Crop"))
+
+  # --- 4) Append MC and return in original col order + MC at end ----
+  nm0 <- names(Result_Prov_Crop)
+  Result_Prov_Crop <- dplyr::mutate(Result_Prov_Crop, MC = i) |>
+                      dplyr::select(dplyr::all_of(nm0), MC)
+  message(
+  "iteration = ", i,
+  "; slope = ", slope,
+  "; intercept = ", intercept,
+  "; coef_F = ", coef_F,
+  "; coef_M = ", coef_M,
+  "; coef_C = ", coef_C,
+  "; coef_NSEF = ", coef_NSEF,
+  "; coef_NS = ", coef_NS
+  )
+  Result_Prov_Crop
+}
+
+
+
+# plan + (optional) raise globals size if needed
+future::plan(future::multisession, workers = workers)
+# options(future.globals.maxSize = 2 * 1024^3)  # uncomment if you hit "globals too large"
+
+# make batches of iteration indices
+idx <- seq_len(n_mc)
+batches <- split(idx, ceiling(seq_along(idx) / batch_size))
+
+# a batch worker: runs many iterations in one process, so Data is serialized ONCE per batch
+run_batch <- function(ii, Data) {
+  acc <- NULL
+  for (i in ii) {
+    res_i <- run_one_mc(i, Data = Data)  # your function unchanged
+    acc <- if (is.null(acc)) res_i else {
+      if (use_vec) vctrs::vec_rbind(acc, res_i) else dplyr::bind_rows(acc, res_i)
+    }
+    rm(res_i)
+  }
+  gc(FALSE)
+  acc
+}
+
+syst_s <- Sys.time()
+
+# run batches in parallel
+parts <- future.apply::future_lapply(
+  batches,
+  run_batch,
+  Data = Data,
+  future.seed = TRUE
+)
+syst_f <- Sys.time()
+syst_f - syst_s
+
+# final combine (once)
+Result_Prov_Crop_MC <- if (use_vec) vctrs::vec_rbind(!!!parts) else dplyr::bind_rows(parts)
+rm(parts); gc(FALSE)
+
+Result_Prov_Crop_MC <- Result_Prov_Crop_MC %>%
+  mutate(N2O = Tot.Fert * N2O.IEF)
+
+#Province and Crop system specific
+summary(Result_Prov_Crop_MC$N2O) # mean 5.11
+saveRDS(Result_Prov_Crop_MC, "Outputs/Uncertainty_Province_Direct.rds")
+
+#Calculate National level results
+Result_MC <- Result_Prov_Crop_MC %>%
+  group_by(MC) %>%
+  summarise(N2O = sum(N2O),
+            Tot.Fert = sum(Tot.Fert)) %>%
+  mutate(CO2e = N2O*44/28*265,              # kg CO2e
+         `CO2e(kt)` = CO2e /10^6) 
+
+summary(Result_MC$`CO2e(kt)`) #median 31.058, mean 38.049
+saveRDS(Result_MC, "Outputs/Uncertainty__Direct.rds")
+
+#Calculate the relative range 
+CI <- Result_MC %>%
+  summarise(
+    median = median(`CO2e(kt)`, na.rm = TRUE),
+    lower  = quantile(`CO2e(kt)`, 0.025, na.rm = TRUE),
+    upper  = quantile(`CO2e(kt)`, 0.975, na.rm = TRUE),
+    rel_lower = (lower - median) / median *100,
+    rel_upper = (upper - median) / median *100,
+    rel_range = (upper - lower) / median *100
+  )
+#-72.7 % - 245.9%
+write.csv(CI, "Outputs/Uncertainty_Range_Direct.csv")
+
+
+
+
+
+```
+
