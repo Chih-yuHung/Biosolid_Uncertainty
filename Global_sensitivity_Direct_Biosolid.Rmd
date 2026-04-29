@@ -1,0 +1,373 @@
+---
+title: "Global sensitivity analysis for direct biosolid N2O uncertainty"
+author: "Dr. Chih-Yu Hung"
+date: "2026-04-28"
+output: html_document
+---
+
+## Purpose
+
+This analysis uses the same Monte Carlo structure as the uncertainty analysis. The goal is to identify which uncertain inputs and parameters explain the largest variation in national direct biosolid N2O emissions, expressed as `CO2e(kt)`.
+
+The method below is a rank based global sensitivity screening. It uses all Monte Carlo samples jointly instead of changing one variable at a time. Two indices are calculated:
+
+1. Spearman correlation, which shows the overall monotonic association between each input and `CO2e(kt)`.
+2. PRCC, partial rank correlation coefficient, which estimates the association of each input with `CO2e(kt)` after controlling for the other sampled inputs.
+
+PRCC is recommended here because your model has nonlinear equations and uncertain inputs are sampled together in each Monte Carlo iteration.
+
+```{r packages}
+# --- Packages ----
+library(tidyverse)
+library(future.apply)
+
+source("Function for N2O EF_Direct_uncertainty.R")
+```
+
+```{r data}
+# --- Read data ----
+Text <- read_csv("Inputs/INPUT-EF_dep_para_texture.csv") %>%
+        select(ECODISTRIC, PROVINCE, Inv_Year_ID, Frac_Coarse, Frac_Medium, Frac_Fine)
+
+PPE <- read_csv("Inputs/INPUT-EF_Fixed_Para.csv")
+DF  <- readRDS("Inputs/BiosolidN_corrected.rds")
+
+# --- Prepare model input ----
+Data_Env <- DF %>%
+  left_join(Text, by = c("Ecodistrict_ID" = "ECODISTRIC", "Province_ID" = "PROVINCE", "Inv_Year_ID")) %>%
+  left_join(PPE, by = c("Ecodistrict_ID", "Province_ID")) %>%
+  mutate(NSE = 1,
+         Nsource = 2) %>%
+  rename(Crop_f = Crop_System_ID) %>%
+  mutate(Crop_f = case_when(
+    Crop_f == 1 ~ 1,
+    Crop_f %in% c(2, 3) ~ 0.19,
+    TRUE ~ NA_real_
+  ))
+
+Data <- Data_Env %>%
+  filter(BION_corrected > 0) %>%
+  rename_at(c(5), ~c("Fert_LCA_kg")) %>%
+  na.omit() %>%
+  filter(Inv_Year_ID == 2015)
+```
+
+```{r user knobs}
+# --- User knobs ----
+use_vec <- requireNamespace("vctrs", quietly = TRUE)
+n_mc  <- 2000
+seed  <- 2026
+workers    <- 6
+batch_size <- 50
+set.seed(seed)
+
+# --- Uncertainty settings ----
+ci_list <- list(
+  Fert_LCA_kg = sqrt(0.15^2 + 0.46^2),
+  P           = 0.10,
+  PE          = 0.10,
+  Topo        = 0.15,
+  Frac_Fine   = 0.10,
+  Frac_Medium = 0.10,
+  Frac_Coarse = 0.10,
+  Crop_f      = 0.305
+)
+
+par_means <- list(
+  slope      = 0.00558,
+  intercept  = 7.701,
+  coef_F     = 2.55,
+  coef_M     = 0.49,
+  coef_C     = 0.49,
+  coef_NSEF  = 1/0.645,
+  coef_NS    = 0.84
+)
+
+par_ci <- list(
+  slope      = 0.22,
+  intercept  = 0.11,
+  coef_F     = 0.20,
+  coef_M     = 0.20,
+  coef_C     = 0.20,
+  coef_NSEF  = 0.13,
+  coef_NS    = 0.60
+)
+
+# 95% CI helper: p95 is the fractional half width of the 95% interval relative to mu
+rnorm_ci <- function(mu, p95) {
+  sd <- abs(p95) * abs(mu) / 1.96
+  rnorm(length(mu), mean = mu, sd = sd)
+}
+
+# Weighted mean helper for row level inputs
+  w_mean <- function(x, w) {
+  weighted.mean(x, w, na.rm = TRUE)
+    }
+```
+
+```{r mc worker for gsa}
+# --- Core per iteration worker for global sensitivity analysis ----
+run_one_gsa <- function(i, Data, ci_list, par_means, par_ci) {
+  df <- Data
+  eps <- 1e-9
+  print(paste0("iteration = ", i))
+
+  # --- 1) Stochastic perturbation of data columns ----
+  df$Fert_LCA_kg <- pmax(rnorm_ci(df$Fert_LCA_kg, ci_list$Fert_LCA_kg), 0)
+
+  df$P      <- pmax(rnorm_ci(df$P, ci_list$P), 0)
+  df$PE     <- pmax(rnorm_ci(df$PE, ci_list$PE), 0)
+  df$F_TOPO <- pmin(pmax(rnorm_ci(df$F_TOPO, ci_list$Topo), 0), 1)
+
+  Fhat <- pmax(rnorm_ci(df$Frac_Fine,   ci_list$Frac_Fine),   eps)
+  Mhat <- pmax(rnorm_ci(df$Frac_Medium, ci_list$Frac_Medium), eps)
+  Chat <- pmax(rnorm_ci(df$Frac_Coarse, ci_list$Frac_Coarse), eps)
+
+  s <- Fhat + Mhat + Chat
+
+  df$Frac_Fine   <- Fhat / s
+  df$Frac_Medium <- Mhat / s
+  df$Frac_Coarse <- Chat / s
+
+  df$Crop_f <- pmax(rnorm_ci(df$Crop_f, ci_list$Crop_f), 0)
+
+
+  # --- 2) Sample model parameters once per iteration ----
+  slope     <- rnorm(1, par_means$slope,     abs(par_ci$slope)     * abs(par_means$slope)     / 1.96)
+  intercept <- rnorm(1, par_means$intercept, abs(par_ci$intercept) * abs(par_means$intercept) / 1.96)
+  coef_F    <- rnorm(1, par_means$coef_F,    abs(par_ci$coef_F)    * abs(par_means$coef_F)    / 1.96)
+  coef_M    <- rnorm(1, par_means$coef_M,    abs(par_ci$coef_M)    * abs(par_means$coef_M)    / 1.96)
+  coef_C    <- rnorm(1, par_means$coef_C,    abs(par_ci$coef_C)    * abs(par_means$coef_C)    / 1.96)
+  coef_NSEF <- rnorm(1, par_means$coef_NSEF, abs(par_ci$coef_NSEF) * abs(par_means$coef_NSEF) / 1.96)
+  coef_NS   <- pmax(rnorm_ci(par_means$coef_NS, par_ci$coef_NS), 0)
+  
+  # --- 3) Bind sampled parameters to the N2OEF_direct function environment ----
+  env_fn <- environment(N2OEF_direct)
+  if (is.null(env_fn)) env_fn <- globalenv()
+
+  assign("slope",     slope,     envir = env_fn)
+  assign("intercept", intercept, envir = env_fn)
+  assign("coef_F",    coef_F,    envir = env_fn)
+  assign("coef_M",    coef_M,    envir = env_fn)
+  assign("coef_C",    coef_C,    envir = env_fn)
+  assign("coef_NSEF", coef_NSEF, envir = env_fn)
+  assign("coef_NS",   coef_NS,   envir = env_fn)
+
+  assign("slope",     slope,     envir = .GlobalEnv)
+  assign("intercept", intercept, envir = .GlobalEnv)
+  assign("coef_F",    coef_F,    envir = .GlobalEnv)
+  assign("coef_M",    coef_M,    envir = .GlobalEnv)
+  assign("coef_C",    coef_C,    envir = .GlobalEnv)
+  assign("coef_NSEF", coef_NSEF, envir = .GlobalEnv)
+  assign("coef_NS",   coef_NS,   envir = .GlobalEnv)
+
+  # --- 4) Run emission factor calculation ----
+  Result_Prov_Crop <- N2OEF_direct(df)
+
+  # --- 5) Convert to national total output ----
+  out_i <- Result_Prov_Crop %>%
+    mutate(N2O = Tot.Fert * N2O.IEF) %>%
+    summarise(N2O = sum(N2O),
+              Tot.Fert = sum(Tot.Fert),
+              .groups = "drop") %>%
+    mutate(CO2e = N2O * 44/28 * 265,
+           CO2e_kt = CO2e / 10^6)
+
+  # --- 6) Save sampled inputs for sensitivity analysis ----
+
+  
+  input_i <- tibble(
+  MC = i,
+  Fert_total = sum(df$Fert_LCA_kg, na.rm = TRUE),
+  P_wtd = w_mean(df$P, df$Fert_LCA_kg),
+  PE_wtd = w_mean(df$PE, df$Fert_LCA_kg),
+  Topo_wtd = w_mean(df$F_TOPO, df$Fert_LCA_kg),
+  Frac_Fine_wtd = w_mean(df$Frac_Fine, df$Fert_LCA_kg),
+  Frac_Medium_wtd = w_mean(df$Frac_Medium, df$Fert_LCA_kg),
+  Frac_Coarse_wtd = w_mean(df$Frac_Coarse, df$Fert_LCA_kg),
+  Crop_f_wtd = w_mean(df$Crop_f, df$Fert_LCA_kg),
+  slope = slope,
+  intercept = intercept,
+  coef_F = coef_F,
+  coef_M = coef_M,
+  coef_C = coef_C,
+  coef_NSEF = coef_NSEF,
+  coef_NS = coef_NS
+  )
+  bind_cols(input_i, out_i)
+}
+```
+
+```{r run mc}
+# --- Run Monte Carlo samples for GSA ----
+future::plan(future::multisession, workers = workers)
+
+idx <- seq_len(n_mc)
+batches <- split(idx, ceiling(seq_along(idx) / batch_size))
+
+run_batch_gsa <- function(ii, Data, ci_list, par_means, par_ci) {
+  acc <- NULL
+  for (i in ii) {
+    res_i <- run_one_gsa(i, Data = Data, ci_list = ci_list, par_means = par_means, par_ci = par_ci)
+    acc <- if (is.null(acc)) res_i else {
+      if (use_vec) vctrs::vec_rbind(acc, res_i) else bind_rows(acc, res_i)
+    }
+    rm(res_i)
+  }
+  gc(FALSE)
+  acc
+}
+
+syst_s <- Sys.time()
+
+parts <- future.apply::future_lapply(
+  batches,
+  run_batch_gsa,
+  Data = Data,
+  ci_list = ci_list,
+  par_means = par_means,
+  par_ci = par_ci,
+  future.seed = TRUE
+)
+
+syst_f <- Sys.time()
+syst_f - syst_s
+
+GSA_MC <- if (use_vec) vctrs::vec_rbind(!!!parts) else bind_rows(parts)
+rm(parts); gc(FALSE)
+
+saveRDS(GSA_MC, "Outputs/GSA_MC_Direct_Biosolid.rds")
+```
+
+```{r check output}
+# --- Check model output ----
+summary(GSA_MC$CO2e_kt)
+
+zero_check <- GSA_MC %>%
+  summarise(n = n(),
+            n_zero = sum(CO2e_kt == 0, na.rm = TRUE),
+            p_zero = mean(CO2e_kt == 0, na.rm = TRUE))
+
+zero_check# no zero
+```
+
+```{r sensitivity functions}
+# --- Inputs used in sensitivity analysis ----
+x_nm <- c(
+  "Fert_total",
+  "P_wtd",
+  "PE_wtd",
+  "Topo_wtd",
+  "Frac_Fine_wtd",
+  "Frac_Medium_wtd",
+  "Frac_Coarse_wtd",
+  "Crop_f_wtd",
+  "slope",
+  "intercept",
+  "coef_F",
+  "coef_M",
+  "coef_C",
+  "coef_NSEF",
+  "coef_NS"
+)
+
+# --- Spearman rank correlation ----
+sens_spearman <- GSA_MC %>%
+  summarise(across(all_of(x_nm), ~ cor(.x, CO2e_kt, method = "spearman", use = "pairwise.complete.obs"))) %>%
+  pivot_longer(everything(), names_to = "parameter", values_to = "spearman") %>%
+  mutate(abs_spearman = abs(spearman)) %>%
+  arrange(desc(abs_spearman))
+
+sens_spearman
+
+# --- Partial rank correlation coefficient ----
+calc_prcc <- function(df, x_nm, y_nm = "CO2e_kt") {
+  df2 <- df %>%
+    select(all_of(c(y_nm, x_nm))) %>%
+    drop_na() %>%
+    mutate(across(everything(), ~ rank(.x, ties.method = "average")))
+
+  map_dfr(x_nm, function(x) {
+    z <- setdiff(x_nm, x)
+    rx <- residuals(lm(reformulate(z, response = x), data = df2))
+    ry <- residuals(lm(reformulate(z, response = y_nm), data = df2))
+    r <- cor(rx, ry, use = "complete.obs")
+    n <- nrow(df2)
+    k <- length(z)
+    tval <- r * sqrt((n - k - 2) / (1 - r^2))
+    pval <- 2 * pt(abs(tval), df = n - k - 2, lower.tail = FALSE)
+    tibble(parameter = x, PRCC = r, p_value = pval)
+  }) %>%
+    mutate(abs_PRCC = abs(PRCC)) %>%
+    arrange(desc(abs_PRCC))
+}
+
+sens_prcc <- calc_prcc(GSA_MC, x_nm)
+sens_prcc
+```
+
+```{r standardized regression}
+# --- Standardized regression coefficient ----
+scale_num <- function(x) as.numeric(scale(x))
+
+GSA_std <- GSA_MC %>%
+  select(CO2e_kt, all_of(x_nm)) %>%
+  drop_na() %>%
+  mutate(across(everything(), scale_num))
+
+fit_src <- lm(reformulate(x_nm, response = "CO2e_kt"), data = GSA_std)
+
+sens_src <- broom::tidy(fit_src) %>%
+  filter(term != "(Intercept)") %>%
+  transmute(parameter = term,
+            SRC = estimate,
+            p_value = p.value,
+            abs_SRC = abs(SRC)) %>%
+  arrange(desc(abs_SRC))
+
+sens_src
+summary(fit_src)
+```
+
+```{r plots}
+# --- PRCC tornado plot ----
+fig_prcc <- sens_prcc %>%
+  ggplot(aes(x = reorder(parameter, PRCC), y = PRCC)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL,
+       y = "Partial rank correlation coefficient",
+       title = "Global sensitivity of national direct biosolid N2O emissions") +
+  theme_bw()
+
+fig_prcc
+
+ggsave("Outputs/GSA_PRCC_Direct_Biosolid.png", fig_prcc, width = 8, height = 5, dpi = 300)
+
+# --- Spearman tornado plot ----
+fig_spearman <- sens_spearman %>%
+  ggplot(aes(x = reorder(parameter, spearman), y = spearman)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL,
+       y = "Spearman rank correlation",
+       title = "Global sensitivity screening using Monte Carlo samples") +
+  theme_bw()
+
+fig_spearman
+
+ggsave("Outputs/GSA_Spearman_Direct_Biosolid.png", fig_spearman, width = 8, height = 5, dpi = 300)
+```
+
+```{r save tables}
+# --- Save sensitivity tables ----
+write_csv(sens_spearman, "Outputs/GSA_Spearman_Direct_Biosolid.csv")
+write_csv(sens_prcc,     "Outputs/GSA_PRCC_Direct_Biosolid.csv")
+write_csv(sens_src,      "Outputs/GSA_SRC_Direct_Biosolid.csv")
+```
+
+## Notes for interpretation
+
+Use `sens_prcc` as the main global sensitivity result. A positive PRCC means higher sampled values of that input tend to increase national `CO2e(kt)`, after controlling for the other inputs. A negative PRCC means higher sampled values tend to decrease national `CO2e(kt)`.
+
+For row level uncertain inputs such as precipitation, evapotranspiration, topography, texture, and crop factor, this script uses fertilizer weighted means within each Monte Carlo iteration. This keeps the sensitivity table compact and makes the national scale interpretation consistent with the emissions calculation.
