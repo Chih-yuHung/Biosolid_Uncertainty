@@ -1,0 +1,253 @@
+---
+title: "Uncertainty_CarbonRetention_Biosolid_CA"
+author: "Dr. Chih-Yu Hung"
+date: "2026-04-30"
+output: html_document
+---
+
+```{r setup}
+# --- Packages ----
+library(tidyverse)
+library(future.apply)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r data_and_function}
+# --- Data preparation ----
+# Goal: uncertainty of soil carbon retention after biosolid application.
+# This analysis keeps only rows with biosolid application and the selected inventory year.
+
+set.seed(2026)
+target_year <- 2015
+
+DF <- readRDS("Inputs/BiosolidN_corrected.rds") # Data from Chang's work
+
+Data <- DF %>%
+  filter(Inv_Year_ID == target_year) %>%
+  select(
+    Inv_Year_ID,
+    Province_ID,
+    Ecodistrict_ID,
+    BION_corrected
+  ) %>%
+  mutate(
+    CN_ratio       = 8.764367816, # Table 1: average C / average N, not average of C/N ratios.
+    BCR            = 0.194,       # Biosolid carbon retention coefficient, Lin et al. 2024.
+    BIOC_corrected = BION_corrected * CN_ratio
+  ) %>%
+  filter(BIOC_corrected > 0) %>%
+  drop_na()
+
+# --- Soil carbon retention calculation ----
+# deltaC is retained biosolid carbon in soil.
+# CO2e is calculated with the molecular weight ratio 44/12.
+# Positive CO2e here means the amount of CO2 equivalent retained in soil.
+
+calc_carbon <- function(df) {
+  df %>%
+    mutate(
+      deltaC = BIOC * BCR
+    ) %>%
+    group_by(Province_ID) %>%
+    summarise(
+      Tot.Carbon = sum(BIOC, na.rm = TRUE),
+      Tot.deltaC = sum(deltaC, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+```
+
+```{r mc_settings}
+# --- User knobs ----
+# n_mc can be increased after testing the script with a smaller number.
+# On Windows, keep workers modest to avoid memory pressure.
+
+use_vec    <- requireNamespace("vctrs", quietly = TRUE)
+n_mc       <- 5000
+workers    <- 4
+batch_size <- 25
+
+
+# --- Random draw helpers ----
+# p95 is the fractional half width of the 95 percent confidence interval.
+# For example, p95 = 0.10 means mean plus or minus 10 percent as a 95 percent interval.
+
+rnorm_ci <- function(mu, p95) {
+  sd <- abs(p95) * abs(mu) / 1.96
+  rnorm(length(mu), mean = mu, sd = sd)
+}
+
+rnorm_scale <- function(p95) {
+  pmax(rnorm_ci(1, p95), 0)
+}
+```
+
+```{r mc_worker}
+# --- Core per iteration worker ----
+# Each iteration perturbs biosolid N input, C/N ratio, and BCR, then recalculates soil C retention.
+# BCR and C/N ratio are sampled once per MC iteration because they are model parameters.
+# Biosolid N input is sampled row by row because it represents activity data uncertainty.
+
+run_one_mc <- function(i, Data,
+                       ci_list = list(
+                         BIOC_corrected = 0.15,
+                         CN_ratio       = 0.26,
+                         BCR            = 0.50
+                       )) {
+  df <- Data
+  message("iteration = ", i)
+  
+  # --- 1) Stochastic perturbation of input data and model parameters ----
+  cn_scale  <- rnorm_scale(ci_list$CN_ratio)
+  bcr_scale <- rnorm_scale(ci_list$BCR)
+  
+  df <- df %>%
+    mutate(
+      BIOC_corrected = pmax(rnorm_ci(BIOC_corrected, ci_list$BIOC_corrected), 0),
+      CN_ratio       = CN_ratio * cn_scale,
+      BCR            = BCR * bcr_scale,
+      BIOC           = BION_corrected * CN_ratio
+    )
+  
+  # --- 2) Run carbon retention calculation ----
+  Result_Prov_MC <- calc_carbon(df) %>%
+    mutate(MC = i)
+  
+  Result_Prov_MC
+}
+
+# --- Batch worker ----
+# Data is serialized once per batch instead of once per MC iteration.
+
+run_batch <- function(ii, Data) {
+  acc <- NULL
+  
+  for (i in ii) {
+    res_i <- run_one_mc(i, Data = Data)
+    acc <- if (is.null(acc)) res_i else {
+      if (use_vec) vctrs::vec_rbind(acc, res_i) else bind_rows(acc, res_i)
+    }
+    rm(res_i)
+  }
+  
+  gc(FALSE)
+  acc
+}
+```
+
+```{r run_mc}
+# --- Run Monte Carlo simulation ----
+# The result is province level retained soil carbon for each MC iteration.
+
+future::plan(future::multisession, workers = workers)
+# options(future.globals.maxSize = 2 * 1024^3) # Uncomment if the globals are too large.
+
+idx <- seq_len(n_mc)
+batches <- split(idx, ceiling(seq_along(idx) / batch_size))
+
+syst_s <- Sys.time()
+
+parts <- future_lapply(
+  batches,
+  run_batch,
+  Data = Data,
+  future.seed = TRUE
+)
+
+syst_f <- Sys.time()
+syst_f - syst_s
+
+Result_Prov_MC <- if (use_vec) vctrs::vec_rbind(!!!parts) else bind_rows(parts)
+rm(parts)
+gc(FALSE)
+
+summary(Result_Prov_MC) # tot.deltaC, median 1619597 mean 3032772
+saveRDS(Result_Prov_MC, "Outputs/Uncertainty_Carbon_Biosolid_Province_CA.rds")
+```
+
+```{r national_summary}
+# --- National uncertainty summary ----
+
+Result_MC <- Result_Prov_MC %>%
+  group_by(MC) %>%
+  summarise(
+    Tot.Carbon = sum(Tot.Carbon, na.rm = TRUE),
+    Tot.deltaC = sum(Tot.deltaC, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    CO2e = Tot.deltaC * 44 / 12,
+    `CO2e(kt)` = CO2e / 10^6
+  )
+
+summary(Result_MC) #CO2ekt 97.968, 100.081
+saveRDS(Result_MC, "Outputs/Uncertainty_Carbon_Biosolid_National_CA.rds")
+
+CI <- Result_MC %>%
+  summarise(
+    median = median(`CO2e(kt)`, na.rm = TRUE),
+    mean   = mean(`CO2e(kt)`, na.rm = TRUE),
+    lower  = quantile(`CO2e(kt)`, 0.025, na.rm = TRUE),
+    upper  = quantile(`CO2e(kt)`, 0.975, na.rm = TRUE),
+    rel_lower = (lower - median) / median * 100,
+    rel_upper = (upper - median) / median * 100,
+    rel_range = (upper - lower) / median * 100
+  )
+
+CI #-52%, 62% 
+write.csv(CI, "Outputs/Uncertainty_Range_Carbon_Biosolid_CA.csv", row.names = FALSE)
+```
+
+```{r province_summary}
+# --- Province level uncertainty summary ----
+# This table shows the median and 95 percent uncertainty interval by province.
+
+CI_Prov <- Result_Prov_MC %>%
+  mutate(
+    CO2e = Tot.deltaC * 44 / 12,
+    `CO2e(kt)` = CO2e / 10^6
+  ) %>%
+  group_by(Province_ID) %>%
+  summarise(
+    median = median(`CO2e(kt)`, na.rm = TRUE),
+    lower  = quantile(`CO2e(kt)`, 0.025, na.rm = TRUE),
+    upper  = quantile(`CO2e(kt)`, 0.975, na.rm = TRUE),
+    rel_lower = (lower - median) / median * 100,
+    rel_upper = (upper - median) / median * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(median))
+
+CI_Prov #ON has the most uncertainty 17.16 - 56.97kt CO2e, relative uncertainties are all -52 and +62
+saveRDS(CI_Prov, "Outputs/Uncertainty_Carbon_Biosolid_Province_CI_CA.rds")
+```
+
+```{r plot_distribution}
+# --- Plot national uncertainty distribution ----
+# The dashed vertical line is the median national retained soil carbon estimate.
+
+p1 <- ggplot(Result_MC, aes(x = `CO2e(kt)`)) +
+  geom_histogram(bins = 40, color = "white") +
+  geom_vline(xintercept = CI$median, linetype = "dashed") +
+  labs(
+    x = expression(CO[2]*e~"retained in soil (kt)"),
+    y = "Monte Carlo count",
+    title = "Uncertainty of soil carbon retention from biosolid application in Canada"
+  ) +
+  theme_bw()
+
+p1
+
+ggsave(
+  "Outputs/Uncertainty_Carbon_Biosolid_CA.png",
+  p1,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+```

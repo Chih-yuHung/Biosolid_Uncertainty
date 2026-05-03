@@ -12,7 +12,7 @@ output: html_document
 library(tidyverse)
 library(future.apply)
 
-source("Function for N2O EF_Direct_uncertainty.R")
+source("2.1_Function for N2O EF_Direct_uncertainty.R")
 
 #Environment parameters
 Text <- read_csv("Inputs/INPUT-EF_dep_para_texture.csv") %>% #Soil texture
@@ -42,7 +42,7 @@ Data <- Data_Env %>% filter(BION_corrected >0 ) %>% #ignore 0 fertilizer to spee
 ```{r cars}
 # --- User knobs (you can change these) ----
 use_vec <- requireNamespace("vctrs", quietly = TRUE)
-n_mc  <- 2000
+n_mc  <- 5000
 seed  <- 2026
 workers    <- 6         # keep small on Windows (2–4)
 batch_size <- 50        # iterations per worker per future
@@ -82,7 +82,7 @@ run_one_mc <- function(i, Data,
                          coef_M     = 0.20,
                          coef_C     = 0.20,
                          coef_NSEF  = 0.13,
-                         coef_NS    = 0.60 # From Chang's MS, I would say it's 95% CI not SD
+                         coef_NS    = 0.40 # From Chang's MS, I would say it's 95% CI not SD
                        )
 ) {
   df <- Data
@@ -217,8 +217,24 @@ Result_Prov_Crop_MC <- Result_Prov_Crop_MC %>%
   mutate(N2O = Tot.Fert * N2O.IEF)
 
 #Province and Crop system specific
-summary(Result_Prov_Crop_MC$N2O) # mean 5.11
+summary(Result_Prov_Crop_MC$N2O) # mean 5.01
 saveRDS(Result_Prov_Crop_MC, "Outputs/Uncertainty_Province_Direct.rds")
+
+#Province based uncertainity
+Result_Prov_Direct <- Result_Prov_Crop_MC %>%
+  group_by(MC, Province) %>%
+  summarise(CO2ekt = sum(N2O) * 44/28 * 265 / 10^6,
+            .groups = "drop") %>%
+  group_by(Province) %>%
+  summarise(
+    median = median(`CO2ekt`, na.rm = TRUE),
+    lower  = quantile(`CO2ekt`, 0.025, na.rm = TRUE),
+    upper  = quantile(`CO2ekt`, 0.975, na.rm = TRUE),
+    rel_lower = (lower - median) / median *100,
+    rel_upper = (upper - median) / median *100,
+    rel_range = (upper - lower) / median *100
+  )
+  
 
 #Calculate National level results
 Result_MC <- Result_Prov_Crop_MC %>%
@@ -228,8 +244,8 @@ Result_MC <- Result_Prov_Crop_MC %>%
   mutate(CO2e = N2O*44/28*265,              # kg CO2e
          `CO2e(kt)` = CO2e /10^6) 
 
-summary(Result_MC$`CO2e(kt)`) #median 31.058, mean 38.049
-saveRDS(Result_MC, "Outputs/Uncertainty__Direct.rds")
+summary(Result_MC$`CO2e(kt)`) #median 31.520, mean 37.340
+saveRDS(Result_MC, "Outputs/Uncertainty_Direct.rds")
 
 #Calculate the relative range 
 CI <- Result_MC %>%
@@ -241,12 +257,7 @@ CI <- Result_MC %>%
     rel_upper = (upper - median) / median *100,
     rel_range = (upper - lower) / median *100
   )
-#-72.7 % - 245.9%
+#-69 % - 212%
 write.csv(CI, "Outputs/Uncertainty_Range_Direct.csv")
-
-
-
-
-
 ```
 

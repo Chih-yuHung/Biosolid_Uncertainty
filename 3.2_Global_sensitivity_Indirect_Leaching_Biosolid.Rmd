@@ -1,0 +1,425 @@
+---
+title: "GSA_Indirect_Leaching_Biosolid_CA"
+author: "Dr. Chih-Yu Hung"
+date: "2026-04-30"
+output: html_document
+---
+
+```{r setup}
+# --- Packages ----
+library(tidyverse)
+library(future.apply)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Method
+
+This file runs a global sensitivity analysis for indirect N2O emissions from leaching due to biosolid N application. The analysis uses the same leaching calculation as the uncertainty analysis, but each uncertain source is drawn once per Monte Carlo iteration so that each source has one value that can be compared with the national output.
+
+Sensitivity is reported using Spearman correlation and partial rank correlation coefficient. Spearman correlation describes the monotonic relationship between one uncertain input and the output. PRCC describes the monotonic relationship after removing the rank effects of the other uncertain inputs. The approximate contribution is calculated from squared PRCC values and normalized to 100 percent.
+
+```{r data_and_function}
+# --- Data preparation ----
+# Goal: global sensitivity analysis of indirect N2O from N leaching due to biosolid N application.
+# This analysis keeps only rows with biosolid N application and the selected inventory year.
+
+target_year <- 2015
+
+PPE <- read_csv("Inputs/INPUT-EF_Fixed_Para.csv") # Ecodistrict level P and PE
+DF  <- readRDS("Inputs/BiosolidN_corrected.rds")  # Corrected biosolid N from Chang's work
+
+Data_Env <- DF %>%
+  left_join(PPE, by = c("Ecodistrict_ID", "Province_ID")) %>%
+  select(Inv_Year_ID, Province_ID, Ecodistrict_ID, BION_corrected, P, PE) %>%
+  rename(Fert_LCA_kg = BION_corrected) %>%
+  filter(
+    Inv_Year_ID == target_year,
+    Fert_LCA_kg > 0
+  ) %>%
+  drop_na()
+
+Data <- Data_Env
+
+# --- Leaching N2O calculation ----
+# Frac_leach follows the IPCC 2019 Refinement style precipitation to evapotranspiration rule.
+# EF5 is the indirect N2O emission factor for leached N.
+# This function returns province level totals and implied emission factors for each GSA draw.
+
+calc_leaching <- function(df, Frac_min, Frac_max, PPE_min, PPE_max, EF5) {
+  slope     <- (Frac_max - Frac_min) / (PPE_max - PPE_min)
+  intercept <- Frac_min - slope * PPE_min
+  eps <- 1e-9
+  
+  df %>%
+    mutate(
+      PPE_ratio = P / pmax(PE, eps),
+      Frac_leach = case_when(
+        PPE_ratio >= PPE_max ~ Frac_max,
+        PPE_ratio <= PPE_min ~ Frac_min,
+        TRUE ~ slope * PPE_ratio + intercept
+      ),
+      Leach_factor = Frac_leach * EF5,
+      N2O = Fert_LCA_kg * Leach_factor
+    ) %>%
+    group_by(Province_ID) %>%
+    summarise(
+      Tot.Fert = sum(Fert_LCA_kg, na.rm = TRUE),
+      Tot.N2O  = sum(N2O, na.rm = TRUE),
+      N2O.IEF  = if_else(Tot.Fert > 0, Tot.N2O / Tot.Fert, NA_real_),
+      .groups = "drop"
+    )
+}
+```
+
+```{r gsa_settings}
+# --- User knobs ----
+# n_gsa can be increased after testing the script with a smaller number.
+# On Windows, keep workers modest to avoid memory pressure.
+
+use_vec    <- requireNamespace("vctrs", quietly = TRUE)
+n_gsa      <- 5000
+seed       <- 2026
+workers    <- 4
+batch_size <- 50
+set.seed(seed)
+
+# --- Random draw helpers ----
+# p95 is the fractional half width of the 95 percent confidence interval.
+# For example, p95 = 0.10 means mean plus or minus 10 percent as a 95 percent interval.
+
+rnorm_ci <- function(mu, p95) {
+  sd <- abs(p95) * abs(mu) / 1.96
+  rnorm(length(mu), mean = mu, sd = sd)
+}
+
+# Draws n values from a triangular distribution with minimum a, mode c, and maximum b.
+rtri1 <- function(n, a, c, b) {
+  stopifnot(a <= c, c <= b, a < b)
+  u <- runif(n)
+  Fc <- (c - a) / (b - a)
+  x <- ifelse(
+    u < Fc,
+    a + sqrt(u * (b - a) * (c - a)),
+    b - sqrt((1 - u) * (b - a) * (b - c))
+  )
+  pmax(a, pmin(x, b))
+}
+```
+
+```{r gsa_worker}
+# --- Core per iteration worker ----
+# Each iteration draws one multiplier or parameter value for each uncertain source.
+# This creates one input value per source per iteration, which is needed for PRCC.
+
+run_one_gsa <- function(i, Data,
+                        ci_list = list(
+                          Fert_LCA_kg = sqrt(0.15^2 + 0.46^2),
+                          P           = 0.10,
+                          PE          = 0.10
+                        ),
+                        par_means = list(
+                          Frac_max = 0.30,
+                          Frac_min = 0.05,
+                          PPE_max  = 1.00,
+                          PPE_min  = 0.23,
+                          EF5_min  = 0.000,
+                          EF5_mode = 0.011,
+                          EF5_max  = 0.020
+                        ),
+                        par_ci = list(
+                          Frac_max = 0.15,
+                          Frac_min = 0.15
+                        )) {
+  message("iteration = ", i)
+  
+  # --- 1) Draw input multipliers ----
+  fert_mult <- pmax(rnorm_ci(1, ci_list$Fert_LCA_kg), 0)
+  P_mult    <- pmax(rnorm_ci(1, ci_list$P), 0)
+  PE_mult   <- pmax(rnorm_ci(1, ci_list$PE), 0)
+  
+  df <- Data %>%
+    mutate(
+      Fert_LCA_kg = Fert_LCA_kg * fert_mult,
+      P           = P * P_mult,
+      PE          = PE * PE_mult
+    )
+  
+  # --- 2) Draw leaching fraction limits ----
+  fmin <- pmin(pmax(rnorm_ci(par_means$Frac_min, par_ci$Frac_min), 0), 1)
+  fmax <- pmin(pmax(rnorm_ci(par_means$Frac_max, par_ci$Frac_max), 0), 1)
+  
+  if (fmax <= fmin) {
+    tmp <- fmin
+    fmin <- fmax
+    fmax <- tmp
+  }
+  
+  # --- 3) Draw EF5 ----
+  EF5 <- rtri1(
+    1,
+    a = par_means$EF5_min,
+    c = par_means$EF5_mode,
+    b = par_means$EF5_max
+  )
+  
+  # --- 4) Run leaching calculation ----
+  Result_Prov_GSA <- calc_leaching(
+    df,
+    Frac_min = fmin,
+    Frac_max = fmax,
+    PPE_min  = par_means$PPE_min,
+    PPE_max  = par_means$PPE_max,
+    EF5      = EF5
+  ) %>%
+    mutate(
+      GSA = i,
+      Fert_LCA_kg_mult = fert_mult,
+      P_mult = P_mult,
+      PE_mult = PE_mult,
+      Frac_min_draw = fmin,
+      Frac_max_draw = fmax,
+      EF5_draw = EF5
+    )
+  
+  Result_Prov_GSA
+}
+
+# --- Batch worker ----
+# Data is serialized once per batch instead of once per GSA iteration.
+
+run_batch_gsa <- function(ii, Data) {
+  acc <- NULL
+  
+  for (i in ii) {
+    res_i <- run_one_gsa(i, Data = Data)
+    acc <- if (is.null(acc)) res_i else {
+      if (use_vec) vctrs::vec_rbind(acc, res_i) else bind_rows(acc, res_i)
+    }
+    rm(res_i)
+  }
+  
+  gc(FALSE)
+  acc
+}
+```
+
+```{r run_gsa}
+# --- Run global sensitivity analysis ----
+# The result is province level leaching N2O for each GSA iteration.
+
+future::plan(future::multisession, workers = workers)
+# options(future.globals.maxSize = 2 * 1024^3) # Uncomment if the globals are too large.
+
+idx <- seq_len(n_gsa)
+batches <- split(idx, ceiling(seq_along(idx) / batch_size))
+
+syst_s <- Sys.time()
+
+parts <- future_lapply(
+  batches,
+  run_batch_gsa,
+  Data = Data,
+  future.seed = TRUE
+)
+
+syst_f <- Sys.time()
+syst_f - syst_s
+
+Result_Prov_GSA <- if (use_vec) vctrs::vec_rbind(!!!parts) else bind_rows(parts)
+rm(parts)
+gc(FALSE)
+
+summary(Result_Prov_GSA) #Tot.N2O: 2114.90, 4095.04, 
+#saveRDS(Result_Prov_GSA, "Outputs/GSA_Indirect_Leaching_Biosolid_Province_CA.rds")
+```
+
+```{r national_gsa_result}
+# --- National GSA result ----
+# N2O is converted to CO2e using molecular weight conversion and GWP100 = 265.
+
+Result_GSA <- Result_Prov_GSA %>%
+  group_by(GSA) %>%
+  summarise(
+    N2O = sum(Tot.N2O, na.rm = TRUE),
+    Tot.Fert = sum(Tot.Fert, na.rm = TRUE),
+    N2O.IEF = if_else(Tot.Fert > 0, N2O / Tot.Fert, NA_real_),
+    Fert_LCA_kg_mult = first(Fert_LCA_kg_mult),
+    P_mult = first(P_mult),
+    PE_mult = first(PE_mult),
+    EF5_draw = first(EF5_draw),
+    Frac_min_draw = first(Frac_min_draw),
+    Frac_max_draw = first(Frac_max_draw),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    CO2e = N2O * 44 / 28 * 265,
+    `CO2e(kt)` = CO2e / 10^6
+  )
+
+summary(Result_GSA) # CO2e(kt) 14.5785, 15.3476
+#saveRDS(Result_GSA, "Outputs/GSA_Indirect_Leaching_Biosolid_National_CA.rds")
+```
+
+```{r prcc_function}
+# --- PRCC helper ----
+# PRCC is calculated by ranking all variables, then correlating residuals.
+# For each input, both the input and output are residualized against all other inputs.
+
+calc_prcc <- function(df, y_col, x_cols) {
+  
+  d <- df %>%
+    select(all_of(c(y_col, x_cols))) %>%
+    drop_na()
+  
+  map_dfr(x_cols, function(x) {
+    
+    other_x <- setdiff(x_cols, x)
+    
+    y_res <- lm(reformulate(other_x, response = y_col), data = d) %>%
+      residuals()
+    
+    x_res <- lm(reformulate(other_x, response = x), data = d) %>%
+      residuals()
+    
+    test <- cor.test(y_res, x_res, method = "spearman")
+    
+    tibble(
+      Parameter = x,
+      PRCC = unname(test$estimate),
+      P_value = test$p.value
+    )
+  })
+}
+```
+
+```{r sensitivity_summary}
+# --- Sensitivity summary ----
+# Spearman shows total monotonic association.
+# PRCC shows monotonic association after accounting for the other uncertain inputs.
+# Approximate contribution is squared PRCC normalized to 100 percent.
+
+x_cols <- c(
+  "Fert_LCA_kg_mult",
+  "P_mult",
+  "PE_mult",
+  "EF5_draw",
+  "Frac_min_draw",
+  "Frac_max_draw"
+)
+
+gsa_long <- Result_GSA %>%
+  select(`CO2e(kt)`, all_of(x_cols)) %>%
+  pivot_longer(
+    cols = all_of(x_cols),
+    names_to = "Parameter",
+    values_to = "Value"
+  )
+
+spearman_tbl <- gsa_long %>%
+  group_by(Parameter) %>%
+  summarise(
+    Spearman = cor(Value, `CO2e(kt)`, method = "spearman", use = "complete.obs"),
+    .groups = "drop"
+  )
+
+Result_GSA$CO2e_kt <- Result_GSA$`CO2e(kt)`
+prcc_tbl <- calc_prcc(Result_GSA, "CO2e_kt", x_cols)
+
+GSA_Summary <- prcc_tbl %>%
+  left_join(spearman_tbl, by = "Parameter") %>%
+  mutate(
+    Abs_PRCC = abs(PRCC),
+    Contribution = PRCC^2 / sum(PRCC^2, na.rm = TRUE) * 100
+  ) %>%
+  arrange(desc(Contribution))
+
+GSA_Summary #Contribution EF5 36%, Fert amount, 34%, Fraction 14%
+saveRDS(GSA_Summary, "Outputs/GSA_Indirect_Leaching_Biosolid_Summary_CA.rds")
+```
+
+```{r plot_prcc}
+# --- Plot PRCC sensitivity ----
+# Larger absolute PRCC means stronger independent monotonic sensitivity.
+
+p1 <- GSA_Summary %>%
+  mutate(Parameter = fct_reorder(Parameter, Abs_PRCC)) %>%
+  ggplot(aes(x = Parameter, y = PRCC)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Partial rank correlation coefficient",
+    title = "Global sensitivity of indirect N2O from biosolid N leaching"
+  ) +
+  theme_bw()
+
+p1
+
+ggsave(
+  "Outputs/GSA_Indirect_Leaching_Biosolid_PRCC_CA.png",
+  p1,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+```
+
+```{r plot_contribution}
+# --- Plot approximate contribution ----
+# Contribution is calculated from squared PRCC and should be interpreted as relative importance.
+
+p2 <- GSA_Summary %>%
+  mutate(Parameter = fct_reorder(Parameter, Contribution)) %>%
+  ggplot(aes(x = Parameter, y = Contribution)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Approximate contribution (%)",
+    title = "Relative contribution based on squared PRCC"
+  ) +
+  theme_bw()
+
+p2
+
+ggsave(
+  "Outputs/GSA_Indirect_Leaching_Biosolid_Contribution_CA.png",
+  p2,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+```
+
+```{r scatter_check}
+# --- Visual check of monotonic relationships ----
+# These plots help check whether PRCC is appropriate.
+# Clear monotonic trends support using Spearman and PRCC.
+
+p3 <- gsa_long %>%
+  ggplot(aes(x = Value, y = `CO2e(kt)`)) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_smooth(method = "loess", se = FALSE) +
+  facet_wrap(~ Parameter, scales = "free_x") +
+  labs(
+    x = "Input draw",
+    y = expression(N[2]*O~CO[2]*e~"(kt)"),
+    title = "Input output relationships for GSA draws"
+  ) +
+  theme_bw()
+
+p3
+
+ggsave(
+  "Outputs/GSA_Indirect_Leaching_Biosolid_Scatter_CA.png",
+  p3,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+```

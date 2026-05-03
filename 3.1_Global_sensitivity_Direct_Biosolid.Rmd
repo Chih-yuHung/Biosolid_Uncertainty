@@ -21,7 +21,7 @@ PRCC is recommended here because your model has nonlinear equations and uncertai
 library(tidyverse)
 library(future.apply)
 
-source("Function for N2O EF_Direct_uncertainty.R")
+source("2.1_Function for N2O EF_Direct_uncertainty.R")
 ```
 
 ```{r data}
@@ -55,7 +55,7 @@ Data <- Data_Env %>%
 ```{r user knobs}
 # --- User knobs ----
 use_vec <- requireNamespace("vctrs", quietly = TRUE)
-n_mc  <- 2000
+n_mc  <- 5000
 seed  <- 2026
 workers    <- 6
 batch_size <- 50
@@ -90,7 +90,7 @@ par_ci <- list(
   coef_M     = 0.20,
   coef_C     = 0.20,
   coef_NSEF  = 0.13,
-  coef_NS    = 0.60
+  coef_NS    = 0.40
 )
 
 # 95% CI helper: p95 is the fractional half width of the 95% interval relative to mu
@@ -236,12 +236,12 @@ syst_f - syst_s
 GSA_MC <- if (use_vec) vctrs::vec_rbind(!!!parts) else bind_rows(parts)
 rm(parts); gc(FALSE)
 
+summary(GSA_MC) # CO2ekt 1.35291, 4.26145
 saveRDS(GSA_MC, "Outputs/GSA_MC_Direct_Biosolid.rds")
 ```
 
 ```{r check output}
 # --- Check model output ----
-summary(GSA_MC$CO2e_kt)
 
 zero_check <- GSA_MC %>%
   summarise(n = n(),
@@ -299,11 +299,12 @@ calc_prcc <- function(df, x_nm, y_nm = "CO2e_kt") {
     tibble(parameter = x, PRCC = r, p_value = pval)
   }) %>%
     mutate(abs_PRCC = abs(PRCC)) %>%
-    arrange(desc(abs_PRCC))
+    arrange(desc(abs_PRCC)) %>%
+    mutate(contribution = PRCC^2 / sum(PRCC^2, na.rm = TRUE) * 100)
 }
 
 sens_prcc <- calc_prcc(GSA_MC, x_nm)
-sens_prcc
+sens_prcc #intercept 54.3%. slope29.1%. NS 14%
 ```
 
 ```{r standardized regression}

@@ -1,0 +1,291 @@
+---
+title: "Uncertainty_Indirect_Volatilisation_Biosolid_CA"
+author: "Dr. Chih-Yu Hung"
+date: "2026-04-30"
+output: html_document
+---
+
+```{r setup}
+# --- Packages ----
+library(tidyverse)
+library(future.apply)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r data_and_function}
+# --- Data preparation ----
+# Goal: uncertainty of indirect N2O from volatilised N due to biosolid N application.
+# This analysis keeps only rows with biosolid N application and the selected inventory year.
+
+target_year <- 2015
+
+DF <- readRDS("Inputs/BiosolidN_corrected.rds") # Data from Chang's work
+
+Data <- DF %>%
+  filter(Inv_Year_ID == target_year) %>%
+  select(
+    Inv_Year_ID,
+    Province_ID,
+    Ecodistrict_ID,
+    Fert_LCA_kg = BION_corrected
+  ) %>%
+  mutate(
+    FRRC_GASM = 0.20,
+    EFVD = 0.01
+  ) %>%
+  filter(Fert_LCA_kg > 0) %>%
+  drop_na()
+
+# --- Volatilisation N2O calculation ----
+# FRRC_GASM is the fraction of applied biosolid N volatilised as NH3 and NOx.
+# EFVD is the indirect N2O emission factor for volatilised N.
+# This function returns province level totals and implied emission factors for each MC draw.
+
+calc_vol <- function(df) {
+  df %>%
+    mutate(
+      N_vol = Fert_LCA_kg * FRAC_GASM,
+      N2O = N_vol * EFVD
+    ) %>%
+    group_by(Province_ID) %>%
+    summarise(
+      Tot.Fert = sum(Fert_LCA_kg, na.rm = TRUE),
+      Tot.Nvol = sum(N_vol, na.rm = TRUE),
+      Tot.N2O  = sum(N2O, na.rm = TRUE),
+      N2O.IEF  = if_else(Tot.Fert > 0, Tot.N2O / Tot.Fert, NA_real_),
+      .groups = "drop"
+    )
+}
+```
+
+```{r mc_settings}
+# --- User knobs ----
+# n_mc can be increased after testing the script with a smaller number.
+# On Windows, keep workers modest to avoid memory pressure.
+
+use_vec    <- requireNamespace("vctrs", quietly = TRUE)
+n_mc       <- 5000
+seed       <- 2026
+workers    <- 4
+batch_size <- 25
+set.seed(seed)
+
+# --- Random draw helpers ----
+# p95 is the fractional half width of the 95 percent confidence interval.
+# For example, p95 = 0.10 means mean plus or minus 10 percent as a 95 percent interval.
+
+rnorm_ci <- function(mu, p95) {
+  sd <- abs(p95) * abs(mu) / 1.96
+  rnorm(length(mu), mean = mu, sd = sd)
+}
+
+# Draws n values from a triangular distribution with minimum a, mode c, and maximum b.
+rtri1 <- function(n, a, c, b) {
+  stopifnot(a <= c, c <= b, a < b)
+  u <- runif(n)
+  Fc <- (c - a) / (b - a)
+  x <- ifelse(
+    u < Fc,
+    a + sqrt(u * (b - a) * (c - a)),
+    b - sqrt((1 - u) * (b - a) * (b - c))
+  )
+  pmax(a, pmin(x, b))
+}
+```
+
+```{r mc_worker}
+# --- Core per iteration worker ----
+# Each iteration perturbs biosolid N and model parameters, then recalculates volatilised N2O.
+# Biosolid N uncertainty combines biosolid amount uncertainty and N content uncertainty by error propagation.
+
+run_one_mc <- function(i, Data,
+                       ci_list = list(
+                         Fert_LCA_kg = sqrt(0.15^2 + 0.46^2)
+                       ),
+                       par_means = list(
+                         FRAC_min  = 0.05 ,
+                         FRAC_mode = 0.20 ,
+                         FRAC_max  = 0.50 ,
+                         EFVD_min  = 0.002,
+                         EFVD_mode = 0.010,
+                         EFVD_max  = 0.040
+                       )) {
+  df <- Data
+  message("iteration = ", i)
+  
+  # --- 1) Stochastic perturbation of input data ----
+  df <- df %>%
+    mutate(
+      Fert_LCA_kg = pmax(rnorm_ci(Fert_LCA_kg, ci_list$Fert_LCA_kg), 0),
+      )
+  
+  # --- 2) Stochastic draw of FRAC_GASM and EFVD ----
+  # Both are sampled once per MC iteration and applied to all ecodistricts.
+  FRAC <- rtri1(
+    1,
+    a = par_means$FRAC_min,
+    c = par_means$FRAC_mode,
+    b = par_means$FRAC_max
+  )
+  
+  EFVD <- rtri1(
+    1,
+    a = par_means$EFVD_min,
+    c = par_means$EFVD_mode,
+    b = par_means$EFVD_max
+  )
+  
+  df <- df %>% mutate(FRAC_GASM = FRAC,
+                      EFVD = EFVD)
+  
+  # --- 3) Run volatilisation calculation ----
+  Result_Prov_MC <- calc_vol(df) %>%
+    mutate(
+      MC = i,
+      EFVD_draw = EFVD,
+      FRRC_GASM_mean = mean(df$FRRC_GASM, na.rm = TRUE)
+    )
+  
+  Result_Prov_MC
+}
+
+# --- Batch worker ----
+# Data is serialized once per batch instead of once per MC iteration.
+
+run_batch <- function(ii, Data) {
+  acc <- NULL
+  
+  for (i in ii) {
+    res_i <- run_one_mc(i, Data = Data)
+    acc <- if (is.null(acc)) res_i else {
+      if (use_vec) vctrs::vec_rbind(acc, res_i) else bind_rows(acc, res_i)
+    }
+    rm(res_i)
+  }
+  
+  gc(FALSE)
+  acc
+}
+```
+
+```{r run_mc}
+# --- Run Monte Carlo simulation ----
+# The result is province level volatilised N2O for each MC iteration.
+
+future::plan(future::multisession, workers = workers)
+# options(future.globals.maxSize = 2 * 1024^3) # Uncomment if the globals are too large.
+
+idx <- seq_len(n_mc)
+batches <- split(idx, ceiling(seq_along(idx) / batch_size))
+
+syst_s <- Sys.time()
+
+parts <- future_lapply(
+  batches,
+  run_batch,
+  Data = Data,
+  future.seed = TRUE
+)
+
+syst_f <- Sys.time()
+syst_f - syst_s
+
+Result_Prov_MC <- if (use_vec) vctrs::vec_rbind(!!!parts) else bind_rows(parts)
+rm(parts)
+gc(FALSE)
+
+summary(Result_Prov_MC) #N2O, 2380.91, 4478.36
+saveRDS(Result_Prov_MC, "Outputs/Uncertainty_Indirect_Volatilisation_Biosolid_Province_CA.rds")
+```
+
+```{r national_summary}
+# --- National uncertainty summary ----
+# N2O is converted to CO2e using molecular weight conversion and GWP100 = 265.
+
+Result_MC <- Result_Prov_MC %>%
+  group_by(MC) %>%
+  summarise(
+    N2O = sum(Tot.N2O, na.rm = TRUE),
+    Tot.Fert = sum(Tot.Fert, na.rm = TRUE),
+    Tot.Nvol = sum(Tot.Nvol, na.rm = TRUE),
+    N2O.IEF = if_else(Tot.Fert > 0, N2O / Tot.Fert, NA_real_),
+    EFVD_draw = first(EFVD_draw),
+    FRRC_GASM_mean = first(FRRC_GASM_mean),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    CO2e = N2O * 44 / 28 * 265,
+    `CO2e(kt)` = CO2e / 10^6
+  )
+
+summary(Result_MC) #CO2ekt 16.305, 16.784
+saveRDS(Result_MC, "Outputs/Uncertainty_Indirect_Volatilisation_Biosolid_National_CA.rds")
+
+CI <- Result_MC %>%
+  summarise(
+    median = median(`CO2e(kt)`, na.rm = TRUE),
+    mean   = mean(`CO2e(kt)`, na.rm = TRUE),
+    lower  = quantile(`CO2e(kt)`, 0.025, na.rm = TRUE),
+    upper  = quantile(`CO2e(kt)`, 0.975, na.rm = TRUE),
+    rel_lower = (lower - median) / median * 100,
+    rel_upper = (upper - median) / median * 100,
+    rel_range = (upper - lower) / median * 100
+  )
+
+CI #- 63% + 80%
+write.csv(CI, "Outputs/Uncertainty_Range_Indirect_Volatilisation_Biosolid_CA.csv", row.names = FALSE)
+```
+
+```{r province_summary}
+# --- Province level uncertainty summary ----
+# This table shows the median and 95 percent uncertainty interval by province.
+
+CI_Prov <- Result_Prov_MC %>%
+  mutate(
+    CO2e = Tot.N2O * 44 / 28 * 265,
+    `CO2e(kt)` = CO2e / 10^6
+  ) %>%
+  group_by(Province_ID) %>%
+  summarise(
+    median = median(`CO2e(kt)`, na.rm = TRUE),
+    lower  = quantile(`CO2e(kt)`, 0.025, na.rm = TRUE),
+    upper  = quantile(`CO2e(kt)`, 0.975, na.rm = TRUE),
+    rel_lower = (lower - median) / median * 100,
+    rel_upper = (upper - median) / median * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(median))
+
+CI_Prov #QC has the highest uncertainty. -64% + 88%
+saveRDS(CI_Prov, "Outputs/Uncertainty_Indirect_Volatilisation_Biosolid_Province_CI_CA.rds")
+```
+
+```{r plot_distribution}
+# --- Plot national uncertainty distribution ----
+# The dashed vertical line is the median national indirect volatilisation emission estimate.
+
+p1 <- ggplot(Result_MC, aes(x = `CO2e(kt)`)) +
+  geom_histogram(bins = 40, color = "white") +
+  geom_vline(xintercept = CI$median, linetype = "dashed") +
+  labs(
+    x = expression(N[2]*O~CO[2]*e~"(kt)"),
+    y = "Monte Carlo count",
+    title = "Uncertainty of indirect N2O from biosolid N volatilisation in Canada"
+  ) +
+  theme_bw()
+
+p1
+
+ggsave(
+  "Outputs/Uncertainty_Indirect_Volatilisation_Biosolid_CA.png",
+  p1,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+```

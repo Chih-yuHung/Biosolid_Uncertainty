@@ -1,0 +1,237 @@
+---
+title: "GSA_CarbonRetention_Biosolid_CA"
+author: "Dr. Chih-Yu Hung"
+date: "2026-04-30"
+output: html_document
+---
+
+```{r setup}
+# --- Packages ----
+library(tidyverse)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r data_and_function}
+# --- Data preparation ----
+# Goal: global sensitivity analysis of soil carbon retention after biosolid application.
+# The selected uncertain parameters are biosolid N input, C/N ratio, and BCR.
+
+set.seed(2026)
+target_year <- 2015
+
+DF <- readRDS("Inputs/BiosolidN_corrected.rds") # Data from Chang's work
+
+Data <- DF %>%
+  filter(Inv_Year_ID == target_year) %>%
+  select(
+    Inv_Year_ID,
+    Province_ID,
+    Ecodistrict_ID,
+    BION_corrected
+  ) %>%
+  mutate(
+    CN_ratio = 8.764367816, # Table 1: average C / average N.
+    BCR      = 0.194,       # Biosolid carbon retention coefficient, Lin et al. 2024.
+    BIOC     = BION_corrected * CN_ratio
+  ) %>%
+  filter(BIOC > 0) %>%
+  drop_na()
+
+# --- Soil carbon retention calculation ----
+# Positive CO2e means the amount of CO2 equivalent retained in soil.
+
+calc_carbon <- function(df) {
+  df %>%
+    mutate(
+      deltaC = BIOC * BCR
+    ) %>%
+    summarise(
+      Tot.Carbon = sum(BIOC, na.rm = TRUE),
+      Tot.deltaC = sum(deltaC, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      CO2e = Tot.deltaC * 44 / 12,
+      `CO2e(kt)` = CO2e / 10^6,
+      CO2e_kt = `CO2e(kt)`
+    )
+}
+```
+
+```{r gsa_settings}
+# --- GSA settings ----
+# Latin hypercube sampling is used to cover the uncertainty space efficiently.
+# PRCC is used because the model response is expected to be monotonic with each input.
+
+n_gsa <- 5000
+seed  <- 2026
+set.seed(seed)
+
+par_tbl <- tibble(
+  par = c("BION_scale", "CN_ratio_scale", "BCR_scale"),
+  mean = c(1, 1, 1),
+  p95  = c(0.15, 0.26, 0.50)
+)
+
+# --- Sampling helpers ----
+
+make_lhs <- function(n, k) {
+  replicate(k, sample((seq_len(n) - runif(n)) / n)) %>%
+    as_tibble(.name_repair = "minimal")
+}
+
+qnorm_ci <- function(p, mu, p95) {
+  sd <- abs(p95) * abs(mu) / 1.96
+  pmax(qnorm(p, mean = mu, sd = sd), 0)
+}
+```
+
+```{r generate_samples}
+# --- Generate Latin hypercube samples ----
+# Each column is transformed to the distribution assigned to that parameter.
+
+U <- make_lhs(n_gsa, nrow(par_tbl))
+names(U) <- par_tbl$par
+
+Sample <- U %>%
+  mutate(
+    BION_scale     = qnorm_ci(BION_scale, 1, par_tbl$p95[par_tbl$par == "BION_scale"]),
+    CN_ratio_scale = qnorm_ci(CN_ratio_scale, 1, par_tbl$p95[par_tbl$par == "CN_ratio_scale"]),
+    BCR_scale      = qnorm_ci(BCR_scale, 1, par_tbl$p95[par_tbl$par == "BCR_scale"])
+  )
+
+summary(Sample)
+```
+
+```{r run_gsa}
+# --- Run GSA model ----
+# Each sample applies one multiplier to all rows, representing parameter uncertainty.
+
+run_one_gsa <- function(i, Data, Sample) {
+  s <- Sample[i, ]
+  
+  Data %>%
+    mutate(
+      BION_corrected = BION_corrected * s$BION_scale,
+      CN_ratio       = CN_ratio * s$CN_ratio_scale,
+      BCR            = BCR * s$BCR_scale,
+      BIOC           = BION_corrected * CN_ratio
+    ) %>%
+    calc_carbon() %>%
+    mutate(
+      GSA = i,
+      BION_scale = s$BION_scale,
+      CN_ratio_scale = s$CN_ratio_scale,
+      BCR_scale = s$BCR_scale
+    )
+}
+
+Result_GSA <- map_dfr(seq_len(n_gsa), run_one_gsa, Data = Data, Sample = Sample)
+
+summary(Result_GSA) # CO2e(kt) 98.058, 100.023
+saveRDS(Result_GSA, "Outputs/GSA_Carbon_Biosolid_CA.rds")
+```
+
+```{r prcc_function}
+# --- PRCC function ----
+# PRCC is the correlation between ranked residuals after removing the effects of other inputs.
+
+calc_prcc <- function(df, y_col, x_cols) {
+  dat <- df %>%
+    select(all_of(c(y_col, x_cols))) %>%
+    drop_na()
+  
+  map_dfr(x_cols, function(x) {
+    others <- setdiff(x_cols, x)
+    
+    y_res <- lm(rank(dat[[y_col]]) ~ ., data = dat %>% select(all_of(others)) %>% mutate(across(everything(), rank))) %>%
+      residuals()
+    
+    x_res <- lm(rank(dat[[x]]) ~ ., data = dat %>% select(all_of(others)) %>% mutate(across(everything(), rank))) %>%
+      residuals()
+    
+    test <- cor.test(x_res, y_res, method = "pearson")
+    
+    tibble(
+      variable = x,
+      PRCC = unname(test$estimate),
+      p.value = test$p.value
+    )
+  }) %>%
+    mutate(
+      abs_PRCC = abs(PRCC),
+      contribution = PRCC^2 / sum(PRCC^2) * 100
+    ) %>%
+    arrange(desc(abs_PRCC))
+}
+```
+
+```{r prcc_results}
+# --- Calculate PRCC ----
+# CO2e_kt is used instead of `CO2e(kt)` to avoid non standard column names in helper functions.
+
+x_cols <- c("BION_scale", "CN_ratio_scale", "BCR_scale")
+
+PRCC_tbl <- calc_prcc(Result_GSA, "CO2e_kt", x_cols)
+
+PRCC_tbl # Contribution, BCR, 41%   BioC = 59%
+write.csv(PRCC_tbl, "Outputs/GSA_PRCC_Carbon_Biosolid_CA.csv", row.names = FALSE)
+```
+
+```{r plot_prcc}
+# --- Plot PRCC ----
+# The sign shows direction. The absolute value shows the strength of monotonic influence.
+
+p_prcc <- PRCC_tbl %>%
+  mutate(variable = fct_reorder(variable, PRCC)) %>%
+  ggplot(aes(x = PRCC, y = variable)) +
+  geom_col() +
+  geom_vline(xintercept = 0) +
+  labs(
+    x = "Partial rank correlation coefficient",
+    y = NULL,
+    title = "Global sensitivity of soil carbon retention from biosolid application"
+  ) +
+  theme_bw()
+
+p_prcc
+
+ggsave(
+  "Outputs/GSA_PRCC_Carbon_Biosolid_CA.png",
+  p_prcc,
+  width = 7,
+  height = 4,
+  dpi = 300
+)
+```
+
+```{r plot_contribution}
+# --- Plot normalized contribution ----
+# Contribution is calculated from squared PRCC and sums to 100 percent.
+
+p_contribution <- PRCC_tbl %>%
+  mutate(variable = fct_reorder(variable, contribution)) %>%
+  ggplot(aes(x = contribution, y = variable)) +
+  geom_col() +
+  labs(
+    x = "Normalized squared PRCC contribution (%)",
+    y = NULL,
+    title = "Relative sensitivity contribution"
+  ) +
+  theme_bw()
+
+p_contribution
+
+ggsave(
+  "Outputs/GSA_Contribution_Carbon_Biosolid_CA.png",
+  p_contribution,
+  width = 7,
+  height = 4,
+  dpi = 300
+)
+```

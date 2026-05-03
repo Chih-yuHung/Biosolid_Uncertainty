@@ -1,0 +1,267 @@
+---
+title: "GSA_Indirect_Volatilisation_Biosolid_CA"
+author: "Dr. Chih-Yu Hung"
+date: "2026-04-30"
+output: html_document
+---
+
+```{r setup}
+# --- Packages ----
+library(tidyverse)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r data_and_function}
+# --- Data preparation ----
+# Goal: global sensitivity analysis of indirect N2O from volatilised biosolid N.
+# The analysis evaluates the contribution of uncertain parameters to national CO2e variation.
+
+target_year <- 2015
+
+DF <- readRDS("Inputs/BiosolidN_corrected.rds") # Data from Chang's work
+
+Data <- DF %>%
+  filter(Inv_Year_ID == target_year) %>%
+  select(
+    Inv_Year_ID,
+    Province_ID,
+    Ecodistrict_ID,
+    Fert_LCA_kg = BION_corrected
+  ) %>%
+  filter(Fert_LCA_kg > 0) %>%
+  drop_na()
+
+
+# --- Volatilisation N2O calculation ----
+# The sampled inputs are applied as national multipliers or national parameter values.
+# This keeps the GSA focused on key national drivers instead of row level random noise.
+
+
+calc_vol_gsa <- function(df, Fert_scale, FRRC_GASM, EFVD) {
+  df %>%
+    mutate(
+      Fert_LCA_kg = Fert_LCA_kg * Fert_scale,
+      FRRC_GASM = FRRC_GASM,
+      EFVD = EFVD,
+      N_vol = Fert_LCA_kg * FRRC_GASM,
+      N2O = N_vol * EFVD
+    ) %>%
+    summarise(
+      Tot.Fert = sum(Fert_LCA_kg, na.rm = TRUE),
+      Tot.Nvol = sum(N_vol, na.rm = TRUE),
+      N2O = sum(N2O, na.rm = TRUE),
+      N2O.IEF = if_else(Tot.Fert > 0, N2O / Tot.Fert, NA_real_),
+      CO2e = N2O * 44 / 28 * 265,
+      `CO2e(kt)` = CO2e / 10^6,
+      .groups = "drop"
+    )
+}
+```
+
+```{r gsa_settings}
+# --- User knobs ----
+# n_gsa can be increased after testing the script with a smaller number.
+
+n_gsa <- 5000
+seed  <- 2026
+set.seed(seed)
+
+# --- Random draw helpers ----
+# p95 is the fractional half width of the 95 percent confidence interval.
+# A national fertilizer multiplier is used so all activity data move together in the GSA.
+
+rnorm_ci <- function(mu, p95) {
+  sd <- abs(p95) * abs(mu) / 1.96
+  rnorm(length(mu), mean = mu, sd = sd)
+}
+
+rtri_q <- function(q, a, c, b) {
+  stopifnot(a <= c, c <= b, a < b)
+  Fc <- (c - a) / (b - a)
+  x <- ifelse(
+    q < Fc,
+    a + sqrt(q * (b - a) * (c - a)),
+    b - sqrt((1 - q) * (b - a) * (b - c))
+  )
+  pmax(a, pmin(x, b))
+}
+
+make_lhs <- function(n, k) {
+  replicate(k, sample((seq_len(n) - runif(n)) / n)) %>%
+    as_tibble(.name_repair = "minimal")
+}
+```
+
+```{r lhs_design}
+# --- Latin hypercube design ----
+# Inputs included in the GSA:
+# Fert_LCA_kg represents national biosolid N activity data.
+# FRRC_GASM represents the volatilisation fraction.
+# EFVD represents the indirect N2O emission factor for volatilised N.
+
+Tot_Fert <- sum(Data$Fert_LCA_kg, na.rm = TRUE)
+
+U <- make_lhs(n_gsa, 3)
+names(U) <- c("u_fert", "u_frrc", "u_efvd")
+
+GSA_design <- U %>%
+  transmute(
+    GSA = row_number(),
+    Fert_scale = pmax(qnorm(u_fert, mean = 1, sd = sqrt(0.15^2 + 0.46^2) / 1.96), 0),
+    Fert_LCA_kg = Tot_Fert * Fert_scale,
+    FRRC_GASM = pmin(pmax(qnorm(u_frrc, mean = 0.20, sd = 0.20 * 0.20 / 1.96), 0), 1),
+    EFVD = rtri_q(u_efvd, a = 0.002, c = 0.010, b = 0.040)
+  )
+
+summary(GSA_design) #Fert_scale 1.00003, 0.99999, Fert_LCA_kg 16036122, 16035463
+```
+
+```{r run_gsa}
+# --- Run GSA simulations ----
+# One national emission result is calculated for each parameter set.
+
+Result_GSA <- pmap_dfr(
+  GSA_design,
+  function(GSA, Fert_scale, Fert_LCA_kg, FRRC_GASM, EFVD) {
+    calc_vol_gsa(
+      Data,
+      Fert_scale = Fert_scale,
+      FRRC_GASM = FRRC_GASM,
+      EFVD = EFVD
+    ) %>%
+      mutate(
+        GSA = GSA,
+        Fert_scale = Fert_scale,
+        Fert_LCA_kg = Fert_LCA_kg,
+        FRRC_GASM = FRRC_GASM,
+        EFVD = EFVD
+      )
+  }
+) %>%
+  select(GSA, Fert_scale, Fert_LCA_kg, FRRC_GASM, EFVD, everything())
+
+summary(Result_GSA$`CO2e(kt)`) #  20.602, 23.146
+saveRDS(Result_GSA, "Outputs/GSA_Indirect_Volatilisation_Biosolid_CA.rds")
+
+```
+
+```{r prcc_function}
+# --- Partial rank correlation coefficient function ----
+# PRCC measures the strength of the monotonic relationship between each input and the output,
+# after removing the rank effects of the other inputs.
+
+calc_prcc <- function(df, y_col, x_cols) {
+  dat <- df %>%
+    select(all_of(c(y_col, x_cols))) %>%
+    drop_na() %>%
+    mutate(across(everything(), rank))
+  
+  map_dfr(x_cols, function(x) {
+    z <- setdiff(x_cols, x)
+    ry <- if (length(z) == 0) dat[[y_col]] else resid(lm(reformulate(z, y_col), data = dat))
+    rx <- if (length(z) == 0) dat[[x]]     else resid(lm(reformulate(z, x),     data = dat))
+    ct <- cor.test(rx, ry, method = "pearson")
+    
+    tibble(
+      input = x,
+      PRCC = unname(ct$estimate),
+      p_value = ct$p.value
+    )
+  }) %>%
+    arrange(desc(abs(PRCC)))
+}
+```
+
+```{r prcc_result}
+# --- Calculate PRCC ----
+# Positive PRCC means the output increases as the input increases.
+# Larger absolute PRCC means a stronger monotonic influence on national emissions.
+
+x_cols <- c("Fert_LCA_kg", "FRRC_GASM", "EFVD")
+
+Result_GSA$CO2e_kt <- Result_GSA$`CO2e(kt)`
+
+prcc_tbl <- calc_prcc(Result_GSA, "CO2e_kt", x_cols)
+
+prcc_tbl
+
+write.csv(
+  prcc_tbl,
+  "Outputs/GSA_PRCC_Indirect_Volatilisation_Biosolid_CA.csv",
+  row.names = FALSE
+)
+```
+
+```{r contribution_result}
+# --- Relative contribution based on PRCC ----
+# This is a practical contribution metric based on normalized squared PRCC.
+# It should be reported as sensitivity contribution, not as emission share.
+
+contribution_tbl <- prcc_tbl %>%
+  mutate(
+    abs_PRCC = abs(PRCC),
+    contribution = PRCC^2 / sum(PRCC^2) * 100
+  ) %>%
+  arrange(desc(contribution))
+
+contribution_tbl # EFVD 44%, Biosolid N 38%, Frac_GASM 18%
+write.csv(contribution_tbl, "Outputs/GSA_Contribution_Indirect_Volatilisation_Biosolid_CA.csv", row.names = FALSE)
+```
+
+```{r plot_prcc}
+# --- Plot PRCC result ----
+# The plot ranks the key uncertain inputs by their monotonic effect on national emissions.
+
+p1 <- ggplot(prcc_tbl, aes(x = reorder(input, abs(PRCC)), y = PRCC)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "PRCC",
+    title = "Global sensitivity of indirect volatilisation N2O emissions"
+  ) +
+  theme_bw()
+
+p1
+
+ggsave(
+  "Outputs/GSA_PRCC_Indirect_Volatilisation_Biosolid_CA.png",
+  p1,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+```
+
+```{r plot_scatter}
+# --- Scatter plot for input output relationships ----
+# This figure helps check whether relationships are monotonic, which supports PRCC interpretation.
+
+p2 <- Result_GSA %>%
+  pivot_longer(all_of(x_cols), names_to = "input", values_to = "value") %>%
+  ggplot(aes(x = value, y = `CO2e(kt)`)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(method = "loess", se = FALSE) +
+  facet_wrap(~ input, scales = "free_x") +
+  labs(
+    x = "Input value",
+    y = expression(N[2]*O~CO[2]*e~"(kt)"),
+    title = "Input output relationships for indirect volatilisation N2O emissions"
+  ) +
+  theme_bw()
+
+p2
+
+ggsave(
+  "Outputs/GSA_Scatter_Indirect_Volatilisation_Biosolid_CA.png",
+  p2,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
